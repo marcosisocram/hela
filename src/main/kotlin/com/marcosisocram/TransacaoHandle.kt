@@ -5,31 +5,31 @@ import io.github.oshai.kotlinlogging.KotlinLogging
 import io.undertow.server.HttpHandler
 import io.undertow.server.HttpServerExchange
 import io.undertow.util.PathTemplateMatch
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.launch
+import org.redisson.api.RedissonClient
 import java.util.regex.Pattern
 
 private val logger = KotlinLogging.logger {}
 private val clientes = mapOf(Pair(1, 100000), Pair(2, 80000), Pair(3, 1000000), Pair(4, 10000000), Pair(5, 500000))
 
-class TransacaoHandle(private val hikariDataSource: HikariDataSource) : HttpHandler {
+class TransacaoHandle(private val hikariDataSource: HikariDataSource, private val redissonClient: RedissonClient) :
+    HttpHandler {
     override fun handleRequest(exchange: HttpServerExchange) {
 
 
         val match = exchange.getAttachment(PathTemplateMatch.ATTACHMENT_KEY)
 
-        val idStr = match.parameters["id"] ?: "0"
-        if (idStr != "1" && idStr != "2" && idStr != "3" && idStr != "4" && idStr != "5") {
+        val id: Int = (match.parameters["id"] ?: "0").toInt()
+        if (id < 0 || id > 5) {
             exchange.statusCode = 404
             return
         }
-
-        val id: Int = idStr.toInt()
 
         val sb = StringBuilder()
         exchange.requestReceiver.receiveFullString { _, s ->
             sb.append(s)
         }
-
-//        logger.info { "Body $sb" }
 
         var valorInt: Int = 0
         var tipo: String = ""
@@ -37,7 +37,7 @@ class TransacaoHandle(private val hikariDataSource: HikariDataSource) : HttpHand
 
 
         val regexValor =
-            Pattern.compile("\"valor\": ?\"?\\W?([a-z-A-Z0-9.]+)\"?|\"tipo\": ?\"([cd])\"|\"descricao\": ?\"([\\w\\s]{1,10})\"")
+            Pattern.compile("\"valor\": ?\"?\\W?([0-9.]+)\"?|\"tipo\": ?\"([cd])\"|\"descricao\": ?\"([\\w\\s]{1,10})\"")
         val matcher = regexValor.matcher(sb)
 
 
@@ -45,7 +45,7 @@ class TransacaoHandle(private val hikariDataSource: HikariDataSource) : HttpHand
             if (matcher.find()) {
                 val valor = matcher.group(1)
 
-                if (valor.indexOf(".") > 0 || valor.contains(Regex("[a-zA-Z]"))) {
+                if (valor.indexOf(".") > 0) {
                     exchange.statusCode = 422
                     return
                 }
@@ -53,7 +53,7 @@ class TransacaoHandle(private val hikariDataSource: HikariDataSource) : HttpHand
                 valorInt = valor.toInt()
             }
         } catch (thr: Throwable) {
-//            logger.error(thr) { "Erro ao pegar o valor" }
+
             exchange.statusCode = 422
             return
         }
@@ -67,7 +67,6 @@ class TransacaoHandle(private val hikariDataSource: HikariDataSource) : HttpHand
             tipo = matcher.group(2)
 
         } catch (thr: Throwable) {
-//            logger.error(thr) { "Erro ao pegar o tipo" }
 
             exchange.statusCode = 422
             return
@@ -82,63 +81,110 @@ class TransacaoHandle(private val hikariDataSource: HikariDataSource) : HttpHand
 
             descricao = matcher.group(3)
         } catch (thr: Throwable) {
-//            logger.error(thr) { "Erro ao pegar a descrição" }
             exchange.statusCode = 422
             return
         }
 
 
-        val connection1 = hikariDataSource.connection
+        val connection = hikariDataSource.connection
 
+        val rLock = redissonClient.getLock("id_client_$id")
 
-        connection1.use { connection2 ->
-            var saldoAtual = 0
+        rLock.lock()
 
-            connection2.prepareStatement("select s from t where c = ? order by r desc fetch first 1 rows only ")//for update wait 0.1
-                .use { st ->
-                    st.setInt(1, id)
+        try {
+            connection.use { itConn ->
+                var saldoAtual = 0
 
-                    st.executeQuery().use { rs ->
-                        while (rs.next()) {
-                            saldoAtual = rs.getInt("s")
+                itConn.prepareStatement("select saldo from clientes where id = ?")
+                    .use { itPrep ->
+                        itPrep.setInt(1, id)
+
+                        itPrep.executeQuery().use { itRs ->
+                            while (itRs.next()) {
+                                saldoAtual = itRs.getInt("saldo")
+                            }
                         }
                     }
-                }
 
-            var response = """{
+                var response = """{
                                             "limite": ${clientes[id]},
                                             """
-            if (tipo == "c") {
-                connection2.prepareStatement("insert into t (c, v, p, d, s) values ($id, $valorInt, 'c', '$descricao', ${saldoAtual + valorInt})")
-                    .use { st ->
-                        st.executeUpdate()
+                if (tipo == "c") {
+
+                    val saldoNovo = saldoAtual + valorInt
+                    itConn.prepareStatement("update clientes set saldo = ? where id = ?")
+                        .use { itPrep ->
+                            itPrep.setInt(1, saldoNovo)
+                            itPrep.setInt(2, id)
+
+                            itPrep.executeUpdate()
+                        }
+
+                    itConn.prepareStatement("insert into transacoes (id_cliente, valor, tipo, descricao) values ($id, $valorInt, 'c', '$descricao')")
+                        .use { itPrep ->
+                            itPrep.executeUpdate()
+                        }
+
+                    response += """
+                                            "saldo": $saldoNovo
+                                        }
+                                    """.trimIndent()
+
+                } else {
+
+                    val novoSaldo = saldoAtual - valorInt
+
+                    if (novoSaldo < (clientes[id]!! * -1)) {
+                        exchange.statusCode = 422
+                        return
+                    } else {
+
+                        itConn.prepareStatement("update clientes set saldo = ? where id = ?")
+                            .use { itPrep ->
+                                itPrep.setInt(1, novoSaldo)
+                                itPrep.setInt(2, id)
+
+                                itPrep.executeUpdate()
+                            }
+
+                        itConn.prepareStatement("insert into transacoes (id_cliente, valor, tipo, descricao) values ($id, $valorInt, 'd', '$descricao')")
+                            .use { st ->
+                                st.executeUpdate()
+                            }
+
+                        response += """
+                                            "saldo": $novoSaldo
+                                        }
+                                    """.trimIndent()
+
+                    }
+                }
+
+                exchange.responseSender.send(response)
+
+            }.also {
+
+                GlobalScope.launch {
+                    val conn = hikariDataSource.connection
+
+                    conn.use { itConn ->
+                        itConn.prepareStatement("delete from transacoes where id_cliente = ? and id not in ( select id from transacoes where id_cliente = ? order by realizada_em desc limit 10)")
+                            .use { it ->
+                                it.setInt(1, id)
+                                it.setInt(2, id)
+
+                                it.executeUpdate()
+                            }
                     }
 
-                response += """
-                                            "saldo": ${saldoAtual + valorInt}
-                                        }
-                                    """.trimIndent()
-
-
-            } else {
-
-                if (saldoAtual - valorInt < (clientes[id]!! * -1)) {
-                    connection2.commit()
-                    exchange.statusCode = 422
-                    return
-                } else {
-                    connection2.prepareStatement("insert into t (c, v, p, d, s) values ($id, $valorInt, 'd', '$descricao', ${saldoAtual - valorInt})")
-                        .use { st ->
-                            st.executeUpdate()
-                        }
-                    response += """
-                                            "saldo": ${saldoAtual - valorInt}
-                                        }
-                                    """.trimIndent()
-
+                    logger.debug { "Limpeza $id" }
                 }
             }
-            exchange.responseSender.send(response)
+        } finally {
+            rLock.unlock()
         }
+
+
     }
 }

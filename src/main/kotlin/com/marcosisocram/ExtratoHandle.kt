@@ -5,6 +5,7 @@ import io.github.oshai.kotlinlogging.KotlinLogging
 import io.undertow.server.HttpHandler
 import io.undertow.server.HttpServerExchange
 import io.undertow.util.PathTemplateMatch
+import kotlinx.coroutines.DelicateCoroutinesApi
 import java.time.LocalDateTime
 
 private val clientes = mapOf(Pair(1, 100000), Pair(2, 80000), Pair(3, 1000000), Pair(4, 10000000), Pair(5, 500000))
@@ -17,81 +18,97 @@ class ExtratoHandle(private val hikariDataSource: HikariDataSource) : HttpHandle
 
         val match = exchange.getAttachment(PathTemplateMatch.ATTACHMENT_KEY)
 
-        val idStr = match.parameters["id"] ?: "0"
-        if(idStr != "1" && idStr != "2" && idStr != "3" && idStr != "4" && idStr != "5") {
+        val id: Int = (match.parameters["id"] ?: "0").toInt()
+        if (id < 0 || id > 5) {
             exchange.statusCode = 404
             return
         }
 
-        val id: Int = idStr.toInt()
-
-        val connection1 = hikariDataSource.connection
+        val connection = hikariDataSource.connection
 
         var response = """
                             {
                             """
 
-        connection1.use { connection2 ->
-            connection2.prepareStatement("select s from t where c = $id order by r desc fetch first 1 rows only")
-                .use { st ->
-                    st.executeQuery().use { rs ->
-                        while (rs.next()) {
-                            val string = rs.getString("s")
-                            response += """"saldo": {
+        connection.use { itConnection ->
+
+            var responseSaldo = ""
+
+            //saldo
+            itConnection.prepareStatement("select saldo from clientes where id = ?")
+                .use { itPrep ->
+                    itPrep.setInt(1, id)
+                    itPrep.executeQuery().use { itRs ->
+
+                        while (itRs.next()) {
+                            val string = itRs.getString("saldo")
+                            responseSaldo += """ "saldo": {
                                                 "total": $string,
                                                 "data_extrato": "${LocalDateTime.now()}",
                                                 "limite": ${clientes[id]}
                                               },
                                         """.trimIndent()
                         }
-                    }
-
-                    if (!response.contains("saldo")) {
-                        response += """"saldo": {
+                        if (responseSaldo.trimIndent().isEmpty()) {
+                            responseSaldo = """
+                                    "saldo": {
                                                 "total": 0,
                                                 "data_extrato": "${LocalDateTime.now()}",
                                                 "limite": ${clientes[id]}
-                                            },
-                                        """.trimIndent()
+                                              },
+                                """.trimIndent()
+                        }
                     }
                 }
-            connection2.prepareStatement("select  v, p, d, r from t where c = $id order by r desc fetch first 10 rows only")
-                .use { st ->
-                    st.executeQuery().use { rs ->
-                        var responseUltimas = """
+
+            var responseUltimas = """
                                             "ultimas_transacoes": [
                                         """.trimIndent()
-                        while (rs.next()) {
 
-                            responseUltimas += """
+            itConnection.prepareStatement("select valor, tipo, descricao, realizada_em from transacoes where id_cliente = ? order by realizada_em desc limit 10")
+                .use { itPrepared ->
+                    itPrepared.setInt(1, id)
+                    itPrepared.executeQuery()
+                        .use { itRs ->
+
+
+                            while (itRs.next()) {
+
+                                responseUltimas += """
                                                     {
-                                                        "valor": ${rs.getInt("v")},
-                                                        "tipo": "${rs.getString("p")}",
-                                                        "descricao": "${rs.getString("d")}",
-                                                        "realizada_em": "${rs.getTimestamp("r").toLocalDateTime()}"
+                                                        "valor": ${itRs.getInt("valor")},
+                                                        "tipo": "${itRs.getString("tipo")}",
+                                                        "descricao": "${itRs.getString("descricao")}",
+                                                        "realizada_em": "${itRs.getTimestamp("realizada_em").toLocalDateTime()}"
                                                     },
                                                 """.trimIndent()
-                        }
-                        if (responseUltimas.contains("},")) {
-                            responseUltimas = responseUltimas.dropLast(1)
-                        }
+                            }
 
-                        responseUltimas += """
+
+                            if (responseUltimas.contains("},")) {
+                                responseUltimas = responseUltimas.dropLast(1)
+                            }
+
+                            responseUltimas += """
                                                 ]
                                             """.trimIndent()
 
-                        response += responseUltimas
-                    }
+                        }
                 }
+
+            responseSaldo += responseUltimas
+
+            response += responseSaldo
         }
+
         response += """
                                         }
                                     """.trimIndent()
 
-//        exchange.responseHeaders["Content-Type"] = "application/json"
         val sender = exchange.responseSender
 
         sender.send(response)
+
 
     }
 }
